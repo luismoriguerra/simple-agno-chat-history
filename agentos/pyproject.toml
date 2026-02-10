@@ -1,7 +1,7 @@
 [project]
 name = "agentos"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "12-factor aligned onboarding agent system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,12 +17,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.1.0",
+]
 test = [
     "langwatch-scenario",
     "pytest",
     "pytest-asyncio",
     "pytest-asyncio-concurrent",
     "pandas",
+    "httpx",
 ]
 
 [tool.pytest.ini_options]

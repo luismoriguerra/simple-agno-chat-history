@@ -1,3 +1,15 @@
+"""
+workflow.py
+
+Onboarding workflow definition with parallel provisioning steps
+and a structured reporting step.
+
+Factors addressed:
+  4 - Tools are structured outputs (reporter parses JSON results)
+  8 - Own your control flow (explicit step graph)
+ 10 - Small, focused agents (reporter has narrow scope)
+"""
+
 from agno.agent import Agent
 from agno.workflow import Step, Workflow
 from agno.workflow.parallel import Parallel
@@ -15,9 +27,14 @@ report_agent = Agent(
     name="Onboarding Reporter",
     model=MODEL,
     instructions=[
-        "Write a short onboarding execution report.",
-        "Include a checklist with SUCCESS/FAIL per system.",
-        "If anything is missing, list next actions.",
+        "Write a short onboarding execution report based on the provisioning results.",
+        "Each provisioning step returns a JSON object with fields: "
+        "system, status, details, error_code, retryable, attempt.",
+        "Parse these JSON results and create a checklist with SUCCESS or FAIL per system.",
+        "If any system has status 'error' or 'fail', mark it as FAIL and include the error details.",
+        "If any step was retried (attempt > 1), note the number of attempts.",
+        "If anything failed, list recommended next actions.",
+        "Always list all 4 systems: Slack, GitHub, Newsletter, and Grants.",
     ],
     markdown=True,
 )
