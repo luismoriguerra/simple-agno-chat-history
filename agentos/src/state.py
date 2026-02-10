@@ -11,14 +11,24 @@ Factors addressed:
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy import Column, DateTime, String, Text, create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from src.models import RunState, RunStatus
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CreateResult:
+    """Outcome of an atomic create-or-get operation."""
+
+    run_state: RunState
+    created: bool
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +98,50 @@ class StateStore:
                 session.add(record)
             session.commit()
 
+    def create_or_get_by_idempotency(self, run_state: RunState) -> CreateResult:
+        """Atomically insert a new run or return the existing one by idempotency key.
+
+        On a unique-key conflict the transaction is rolled back and the
+        existing row is fetched, making the operation safe under concurrent
+        requests with the same ``idempotency_key``.
+
+        If ``run_state.idempotency_key`` is ``None`` a normal insert is
+        performed (no conflict possible).
+        """
+        if not run_state.idempotency_key:
+            self.save(run_state)
+            return CreateResult(run_state=run_state, created=True)
+
+        with self._session_factory() as session:
+            try:
+                record = RunStateRecord(
+                    run_id=run_state.run_id,
+                    session_id=run_state.session_id,
+                    company_name=run_state.company_name,
+                    status=run_state.status.value,
+                    state_json=run_state.model_dump_json(),
+                    idempotency_key=run_state.idempotency_key,
+                    created_at=run_state.created_at,
+                    updated_at=run_state.updated_at,
+                )
+                session.add(record)
+                session.commit()
+                return CreateResult(run_state=run_state, created=True)
+            except IntegrityError:
+                session.rollback()
+                existing_record = (
+                    session.query(RunStateRecord)
+                    .filter_by(idempotency_key=run_state.idempotency_key)
+                    .first()
+                )
+                if existing_record is None:
+                    raise RuntimeError(
+                        "IntegrityError on idempotency_key but no matching "
+                        "record found on re-read."
+                    )
+                existing = RunState.model_validate_json(existing_record.state_json)
+                return CreateResult(run_state=existing, created=False)
+
     # -- read ------------------------------------------------------------------
 
     def load(self, run_id: str) -> Optional[RunState]:
@@ -131,6 +185,16 @@ class StateStore:
             records = (
                 session.query(RunStateRecord)
                 .filter(RunStateRecord.status.in_(active_statuses))
+                .all()
+            )
+            return [RunState.model_validate_json(r.state_json) for r in records]
+
+    def list_by_status(self, status: RunStatus) -> list[RunState]:
+        """List all runs matching a specific status (DB-level filter)."""
+        with self._session_factory() as session:
+            records = (
+                session.query(RunStateRecord)
+                .filter_by(status=status.value)
                 .all()
             )
             return [RunState.model_validate_json(r.state_json) for r in records]

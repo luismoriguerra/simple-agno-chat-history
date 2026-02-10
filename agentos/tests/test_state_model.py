@@ -290,3 +290,55 @@ class TestStateStore:
 
         results = store.find_by_session("sess-a")
         assert len(results) == 2
+
+    # -- create_or_get_by_idempotency ----------------------------------------
+
+    def test_create_or_get_new_run(self, store):
+        """First insert with an idempotency key should create the run."""
+        run = RunState(company_name="New Co", idempotency_key="key-new")
+        result = store.create_or_get_by_idempotency(run)
+        assert result.created is True
+        assert result.run_state.run_id == run.run_id
+
+    def test_create_or_get_returns_existing_on_conflict(self, store):
+        """Second insert with the same idempotency key returns the existing run."""
+        run1 = RunState(company_name="First Co", idempotency_key="key-dup")
+        result1 = store.create_or_get_by_idempotency(run1)
+        assert result1.created is True
+
+        run2 = RunState(company_name="Second Co", idempotency_key="key-dup")
+        result2 = store.create_or_get_by_idempotency(run2)
+        assert result2.created is False
+        assert result2.run_state.run_id == run1.run_id
+
+    def test_create_or_get_without_key_always_creates(self, store):
+        """Runs without idempotency_key should always be created."""
+        run1 = RunState(company_name="No Key 1")
+        run2 = RunState(company_name="No Key 2")
+        r1 = store.create_or_get_by_idempotency(run1)
+        r2 = store.create_or_get_by_idempotency(run2)
+        assert r1.created is True
+        assert r2.created is True
+        assert r1.run_state.run_id != r2.run_state.run_id
+
+    # -- list_by_status ------------------------------------------------------
+
+    def test_list_by_status(self, store):
+        store.save(RunState(company_name="R1", status=RunStatus.RUNNING))
+        store.save(RunState(company_name="P1", status=RunStatus.PAUSED))
+        store.save(RunState(company_name="P2", status=RunStatus.PAUSED))
+        store.save(RunState(company_name="C1", status=RunStatus.COMPLETED))
+
+        paused = store.list_by_status(RunStatus.PAUSED)
+        assert len(paused) == 2
+        assert all(r.status == RunStatus.PAUSED for r in paused)
+
+        completed = store.list_by_status(RunStatus.COMPLETED)
+        assert len(completed) == 1
+        assert completed[0].company_name == "C1"
+
+    def test_list_by_status_empty(self, store):
+        store.save(RunState(company_name="R1", status=RunStatus.RUNNING))
+
+        result = store.list_by_status(RunStatus.FAILED)
+        assert result == []

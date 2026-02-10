@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from src.api import router, set_state_store
+from src.api import router
 from src.models import RunState, RunStatus
 from src.state import StateStore
 
@@ -22,14 +22,13 @@ from src.state import StateStore
 @pytest.fixture
 def store(tmp_path):
     db_path = tmp_path / "test_api.db"
-    s = StateStore(db_url=f"sqlite:///{db_path}")
-    set_state_store(s)
-    return s
+    return StateStore(db_url=f"sqlite:///{db_path}")
 
 
 @pytest.fixture
 def client(store):
     app = FastAPI()
+    app.state.state_store = store
     app.include_router(router)
     return TestClient(app)
 
@@ -56,6 +55,12 @@ class TestLaunchEndpoint:
         resp2 = client.post("/api/v1/runs", json=payload)
         assert resp1.json()["run_id"] == resp2.json()["run_id"]
         assert resp2.json()["message"] == "Run already exists (idempotent)."
+
+    def test_launch_without_idempotency_key_creates_distinct_runs(self, client):
+        """Two launches without idempotency_key should create two separate runs."""
+        resp1 = client.post("/api/v1/runs", json={"company_name": "Acme Corp"})
+        resp2 = client.post("/api/v1/runs", json={"company_name": "Acme Corp"})
+        assert resp1.json()["run_id"] != resp2.json()["run_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ class TestResumeEndpoint:
 
         resp = client.post(
             f"/api/v1/runs/{run.run_id}/resume",
-            json={"event_type": "manual", "data": {"note": "resuming"}},
+            json={"data": {"note": "resuming"}},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "running"
@@ -143,6 +148,18 @@ class TestResumeEndpoint:
             json={"data": {}},
         )
         assert resp.status_code == 409
+
+    def test_resume_request_rejects_unknown_fields(self, client, store):
+        """ResumeRequest no longer accepts event_type -- extra fields are ignored by Pydantic
+        but the schema should only contain 'data'."""
+        run = RunState(company_name="Schema Co", status=RunStatus.PAUSED)
+        store.save(run)
+
+        resp = client.post(
+            f"/api/v1/runs/{run.run_id}/resume",
+            json={"data": {"note": "ok"}},
+        )
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +249,20 @@ class TestListRunsEndpoint:
         assert resp.status_code == 200
         runs = resp.json()
         assert all(r["status"] == "paused" for r in runs)
+
+    def test_list_invalid_status_returns_400(self, client):
+        """An unrecognized status value should be rejected with 400."""
+        resp = client.get("/api/v1/runs", params={"status": "banana"})
+        assert resp.status_code == 400
+        assert "Invalid status" in resp.json()["detail"]
+
+    def test_list_all_statuses_via_filter(self, client, store):
+        """Using a valid terminal status should return those runs."""
+        store.save(RunState(company_name="Done1", status=RunStatus.COMPLETED))
+        store.save(RunState(company_name="Running1"))
+
+        resp = client.get("/api/v1/runs", params={"status": "completed"})
+        assert resp.status_code == 200
+        runs = resp.json()
+        assert len(runs) == 1
+        assert runs[0]["company_name"] == "Done1"

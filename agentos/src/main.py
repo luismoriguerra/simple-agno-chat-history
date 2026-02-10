@@ -28,17 +28,13 @@ load_dotenv()
 
 from src import instrumentation  # noqa: E402
 from agno.os import AgentOS  # noqa: E402
-from src.api import router as api_router, set_state_store  # noqa: E402
+from src.api import router as api_router  # noqa: E402
 from src.config import DB, get_state_db_url  # noqa: E402
 from src.state import StateStore  # noqa: E402
 from src.team import supervisor_team  # noqa: E402
 from src.workflow import onboarding_workflow  # noqa: E402
 
 instrumentation.setup()
-
-# Initialize the workflow state store
-state_store = StateStore(db_url=get_state_db_url())
-set_state_store(state_store)
 
 agent_os = AgentOS(
     id="onboarding-demo",
@@ -48,6 +44,9 @@ agent_os = AgentOS(
 )
 
 app = agent_os.get_app()
+
+# Attach state store to app.state so API endpoints can access it via dependency
+app.state.state_store = StateStore(db_url=get_state_db_url())
 
 # Mount the workflow lifecycle API routes
 app.include_router(api_router)

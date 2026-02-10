@@ -11,11 +11,12 @@ Factors addressed:
 """
 
 import uuid
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from src.instrumentation import log_workflow_event
 from src.models import EventType, RunState, RunStatus, WorkflowEvent
 from src.state import StateStore
 
@@ -40,7 +41,6 @@ class LaunchResponse(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    event_type: str = "approval_received"
     data: dict = {}
 
 
@@ -61,22 +61,22 @@ class WebhookPayload(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# State store singleton (injected from main.py)
+# Dependency injection
 # ---------------------------------------------------------------------------
 
-_store: Optional[StateStore] = None
+
+def get_state_store(request: Request) -> StateStore:
+    """FastAPI dependency that retrieves the StateStore from app state."""
+    store: Optional[StateStore] = getattr(request.app.state, "state_store", None)
+    if store is None:
+        raise RuntimeError(
+            "StateStore not initialized. "
+            "Assign it to app.state.state_store during startup."
+        )
+    return store
 
 
-def set_state_store(store: StateStore) -> None:
-    """Inject the state store singleton used by all endpoints."""
-    global _store
-    _store = store
-
-
-def _get_store() -> StateStore:
-    if _store is None:
-        raise RuntimeError("StateStore not initialized. Call set_state_store() first.")
-    return _store
+StoreDep = Annotated[StateStore, Depends(get_state_store)]
 
 
 # ---------------------------------------------------------------------------
@@ -85,24 +85,13 @@ def _get_store() -> StateStore:
 
 
 @router.post("/runs", response_model=LaunchResponse)
-def launch_run(req: LaunchRequest) -> LaunchResponse:
+def launch_run(req: LaunchRequest, store: StoreDep) -> LaunchResponse:
     """Launch a new workflow run.
 
     Supports idempotency: if a run with the same idempotency_key already
     exists, return the existing run instead of creating a new one.
+    Uses an atomic create-or-get to handle concurrent requests safely.
     """
-    store = _get_store()
-
-    # Idempotency check
-    if req.idempotency_key:
-        existing = store.find_by_idempotency_key(req.idempotency_key)
-        if existing:
-            return LaunchResponse(
-                run_id=existing.run_id,
-                status=existing.status.value,
-                message="Run already exists (idempotent).",
-            )
-
     run = RunState(
         session_id=req.session_id or str(uuid.uuid4()),
         company_name=req.company_name,
@@ -114,19 +103,31 @@ def launch_run(req: LaunchRequest) -> LaunchResponse:
             data={"company_name": req.company_name},
         )
     )
-    store.save(run)
+
+    result = store.create_or_get_by_idempotency(run)
+
+    if result.created:
+        log_workflow_event(
+            "launch",
+            {"company_name": req.company_name},
+            run_id=result.run_state.run_id,
+        )
+        return LaunchResponse(
+            run_id=result.run_state.run_id,
+            status=result.run_state.status.value,
+            message=f"Run launched for company '{req.company_name}'.",
+        )
 
     return LaunchResponse(
-        run_id=run.run_id,
-        status=run.status.value,
-        message=f"Run launched for company '{req.company_name}'.",
+        run_id=result.run_state.run_id,
+        status=result.run_state.status.value,
+        message="Run already exists (idempotent).",
     )
 
 
 @router.get("/runs/{run_id}", response_model=RunStateResponse)
-def get_run(run_id: str) -> RunStateResponse:
+def get_run(run_id: str, store: StoreDep) -> RunStateResponse:
     """Get current state of a workflow run."""
-    store = _get_store()
     run = store.load(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -141,9 +142,8 @@ def get_run(run_id: str) -> RunStateResponse:
 
 
 @router.post("/runs/{run_id}/pause")
-def pause_run(run_id: str) -> dict:
+def pause_run(run_id: str, store: StoreDep) -> dict:
     """Pause an active workflow run."""
-    store = _get_store()
     run = store.load(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -161,13 +161,13 @@ def pause_run(run_id: str) -> dict:
         )
     )
     store.save(run)
+    log_workflow_event("pause", {"reason": "Manual pause via API"}, run_id=run_id)
     return {"run_id": run_id, "status": "paused", "message": "Run paused."}
 
 
 @router.post("/runs/{run_id}/resume")
-def resume_run(run_id: str, req: ResumeRequest) -> dict:
+def resume_run(run_id: str, req: ResumeRequest, store: StoreDep) -> dict:
     """Resume a paused or approval-waiting run."""
-    store = _get_store()
     run = store.load(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -185,17 +185,17 @@ def resume_run(run_id: str, req: ResumeRequest) -> dict:
         )
     )
     store.save(run)
+    log_workflow_event("resume", req.data, run_id=run_id)
     return {"run_id": run_id, "status": "running", "message": "Run resumed."}
 
 
 @router.post("/webhooks/approval")
-def receive_approval_webhook(payload: WebhookPayload) -> dict:
+def receive_approval_webhook(payload: WebhookPayload, store: StoreDep) -> dict:
     """Receive external approval webhook and resume or fail the run.
 
     This endpoint is designed to be called by external systems (Slack bots,
     email links, admin dashboards) to approve or deny a pending action.
     """
-    store = _get_store()
     run = store.load(payload.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -218,6 +218,12 @@ def receive_approval_webhook(payload: WebhookPayload) -> dict:
     run.status = RunStatus.RUNNING if payload.approved else RunStatus.FAILED
     store.save(run)
 
+    log_workflow_event(
+        "approval_webhook",
+        {"approved": payload.approved, "responder": payload.responder},
+        run_id=payload.run_id,
+    )
+
     return {
         "run_id": payload.run_id,
         "approved": payload.approved,
@@ -230,13 +236,33 @@ def receive_approval_webhook(payload: WebhookPayload) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Status enum helper
+# ---------------------------------------------------------------------------
+
+_VALID_STATUSES = {s.value for s in RunStatus}
+
+
 @router.get("/runs")
-def list_runs(status: Optional[str] = None) -> list[RunStateResponse]:
-    """List workflow runs, optionally filtered by status."""
-    store = _get_store()
+def list_runs(
+    store: StoreDep, status: Optional[str] = None
+) -> list[RunStateResponse]:
+    """List workflow runs, optionally filtered by status.
+
+    When ``status`` is provided it is validated against ``RunStatus`` values
+    and filtering is done at the database level.  Without a filter the
+    endpoint returns only active (non-terminal) runs.
+    """
     if status:
-        runs = store.list_all()
-        runs = [r for r in runs if r.status.value == status]
+        if status not in _VALID_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid status '{status}'. "
+                    f"Valid values: {sorted(_VALID_STATUSES)}."
+                ),
+            )
+        runs = store.list_by_status(RunStatus(status))
     else:
         runs = store.list_active()
 
