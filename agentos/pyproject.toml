@@ -1,0 +1,32 @@
+[project]
+name = "agentos"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "agno",
+    "anthropic",
+    "boto3",
+    "fastapi[standard]",
+    "python-dotenv",
+    "langwatch",
+    "openinference-instrumentation-agno",
+    "sqlalchemy>=2.0.46",
+    "pyjwt>=2.11.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "langwatch-scenario",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-asyncio-concurrent",
+    "pandas",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "agent_test: marks tests as agent scenario tests",
+]
